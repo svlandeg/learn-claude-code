@@ -3,7 +3,7 @@
 s13: Agent Teams - persistent teammates with shared tasks and mailboxes.
 
 Run:  python s13_agent_teams/code.py
-Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
+Need: pip install openai python-dotenv + .env with OPENCODE_API_KEY
 
     +------+  spawn(task_id)  +----------+  result  +------+
     | Lead | ---------------> |   WORK   | -------> | IDLE |
@@ -34,6 +34,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
+from types import SimpleNamespace
 
 try:
     import readline
@@ -41,15 +42,16 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    api_key=os.getenv("OPENCODE_API_KEY"),
+    base_url="https://opencode.ai/zen/v1",
+)
 MODEL = os.environ["MODEL_ID"]
 
 # -- Task System --
@@ -1269,10 +1271,9 @@ class TeammateRuntime:
         with team_lock:
             active_teammates[self.name] = "working"
         try:
-            response = client.messages.create(
+            response = client.chat.completions.create(
                 model=MODEL,
-                system=self.system,
-                messages=self.messages,
+                messages=[{"role": "system", "content": self.system}, *self.messages],
                 tools=TEAMMATE_TOOLS,
                 max_tokens=8000,
             )
@@ -1281,10 +1282,15 @@ class TeammateRuntime:
                      f"{type(exc).__name__}: {exc}", "error")
             return "stop"
 
-        self.messages.append({"role": "assistant",
-                              "content": response.content})
+        message = response.choices[0].message
+        self.messages.append(message)
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            SimpleNamespace(
+                id=call.id,
+                name=call.function.name,
+                input=json.loads(call.function.arguments or "{}"),
+            )
+            for call in (message.tool_calls or [])
         ]
         if tool_calls:
             results = []
@@ -1292,13 +1298,11 @@ class TeammateRuntime:
                 output = _run_teammate_tool(
                     self.name, block, self.handlers
                 )
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": output})
-            self.messages.append({"role": "user", "content": results})
+                results.append({"role": "tool", "tool_call_id": block.id, "content": output})
+            self.messages.extend(results)
             return "continue"
 
-        summary = _last_assistant_text(response.content)
+        summary = (response.choices[0].message.content or "")
         gate = plan_gates.get(self.name, "not_required")
         if gate != "pending" and summary:
             BUS.send(self.name, "lead", summary, "result")
@@ -1502,44 +1506,44 @@ def run_create_worktree(name: str, task_id: str) -> str:
 # -- Tool Definitions --
 
 BASE_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object",
+    {"type": "function", "function": {"name": "bash", "description": "Run a shell command.",
+     "parameters": {"type": "object",
                       "properties": {"command": {"type": "string"}},
-                      "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object",
+                      "required": ["command"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read file contents.",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "limit": {"type": "integer"}},
-                      "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object",
+                      "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Write content to a file.",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "content": {"type": "string"}},
-                      "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text once.",
-     "input_schema": {"type": "object",
+                      "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text once.",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "old_text": {"type": "string"},
                                      "new_text": {"type": "string"}},
-                      "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files by glob pattern; ** matches recursively.",
-     "input_schema": {"type": "object",
+                      "required": ["path", "old_text", "new_text"]}}},
+    {"type": "function", "function": {"name": "glob", "description": "Find files by glob pattern; ** matches recursively.",
+     "parameters": {"type": "object",
                       "properties": {"pattern": {"type": "string"}},
-                      "required": ["pattern"]}},
+                      "required": ["pattern"]}}},
 ]
 
 TASK_TOOLS = [
-    {"name": "create_task",
+    {"type": "function", "function": {"name": "create_task",
      "description": "Create a task and return its runtime-generated ID.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {
                           "subject": {"type": "string"},
                           "description": {"type": "string"}},
                       "required": ["subject"],
-                      "additionalProperties": False}},
-    {"name": "update_task",
+                      "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "update_task",
      "description": "Add dependencies using IDs returned by create_task.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {
                           "task_id": {"type": "string",
                                       "pattern": "^task_[0-9a-f]{8}$"},
@@ -1549,45 +1553,45 @@ TASK_TOOLS = [
                                         "pattern": "^task_[0-9a-f]{8}$"},
                               "minItems": 1}},
                       "required": ["task_id", "addBlockedBy"],
-                      "additionalProperties": False}},
-    {"name": "list_tasks", "description": "List shared tasks.",
-     "input_schema": {"type": "object", "properties": {}}},
-    {"name": "get_task", "description": "Get one task by ID.",
-     "input_schema": {"type": "object",
+                      "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "list_tasks", "description": "List shared tasks.",
+     "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "get_task", "description": "Get one task by ID.",
+     "parameters": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
-                      "required": ["task_id"]}},
-    {"name": "claim_task", "description": "Claim a ready task.",
-     "input_schema": {"type": "object",
+                      "required": ["task_id"]}}},
+    {"type": "function", "function": {"name": "claim_task", "description": "Claim a ready task.",
+     "parameters": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
-                      "required": ["task_id"]}},
-    {"name": "complete_task", "description": "Complete an owned task.",
-     "input_schema": {"type": "object",
+                      "required": ["task_id"]}}},
+    {"type": "function", "function": {"name": "complete_task", "description": "Complete an owned task.",
+     "parameters": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
-                      "required": ["task_id"]}},
+                      "required": ["task_id"]}}},
 ]
 
 TEAMMATE_TOOLS = [
     *BASE_TOOLS,
-    {"name": "send_message",
+    {"type": "function", "function": {"name": "send_message",
      "description": "Send an intermediate message to 'lead' or an active teammate.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {"to": {"type": "string"},
                                      "content": {"type": "string"}},
-                      "required": ["to", "content"]}},
-    {"name": "submit_plan",
+                      "required": ["to", "content"]}}},
+    {"type": "function", "function": {"name": "submit_plan",
      "description": "Submit a work plan for Lead approval.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {"plan": {"type": "string"}},
-                      "required": ["plan"]}},
-    next(tool for tool in TASK_TOOLS if tool["name"] == "list_tasks"),
-    next(tool for tool in TASK_TOOLS if tool["name"] == "claim_task"),
-    next(tool for tool in TASK_TOOLS if tool["name"] == "complete_task"),
+                      "required": ["plan"]}}},
+    next(tool for tool in TASK_TOOLS if tool["function"]["name"] == "list_tasks"),
+    next(tool for tool in TASK_TOOLS if tool["function"]["name"] == "claim_task"),
+    next(tool for tool in TASK_TOOLS if tool["function"]["name"] == "complete_task"),
 ]
 
 TEAM_TOOLS = [
-    {"name": "spawn_teammate",
+    {"type": "function", "function": {"name": "spawn_teammate",
      "description": "Spawn a persistent teammate.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {
                           "name": {"type": "string",
                                    "pattern": "^[A-Za-z0-9_-]{1,64}$"},
@@ -1596,35 +1600,35 @@ TEAM_TOOLS = [
                           "task_id": {"type": "string",
                                       "pattern": "^task_[0-9a-f]{8}$"},
                           "require_plan": {"type": "boolean"}},
-                      "required": ["name", "role", "prompt"]}},
-    {"name": "list_teammates", "description": "List active teammates.",
-     "input_schema": {"type": "object", "properties": {}}},
-    {"name": "send_message", "description": "Message a teammate.",
-     "input_schema": {"type": "object",
+                      "required": ["name", "role", "prompt"]}}},
+    {"type": "function", "function": {"name": "list_teammates", "description": "List active teammates.",
+     "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "send_message", "description": "Message a teammate.",
+     "parameters": {"type": "object",
                       "properties": {"to": {"type": "string"},
                                      "content": {"type": "string"}},
-                      "required": ["to", "content"]}},
-    {"name": "request_shutdown",
+                      "required": ["to", "content"]}}},
+    {"type": "function", "function": {"name": "request_shutdown",
      "description": "Ask a teammate to shut down.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {"teammate": {"type": "string"}},
-                      "required": ["teammate"]}},
-    {"name": "request_plan",
+                      "required": ["teammate"]}}},
+    {"type": "function", "function": {"name": "request_plan",
      "description": "Require a teammate plan before workspace changes.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {"teammate": {"type": "string"},
                                      "task": {"type": "string"}},
-                      "required": ["teammate", "task"]}},
-    {"name": "review_plan", "description": "Approve or reject a plan.",
-     "input_schema": {"type": "object",
+                      "required": ["teammate", "task"]}}},
+    {"type": "function", "function": {"name": "review_plan", "description": "Approve or reject a plan.",
+     "parameters": {"type": "object",
                       "properties": {
                           "request_id": {"type": "string"},
                           "approve": {"type": "boolean"},
                           "feedback": {"type": "string"}},
-                      "required": ["request_id", "approve"]}},
-    {"name": "create_worktree",
+                      "required": ["request_id", "approve"]}}},
+    {"type": "function", "function": {"name": "create_worktree",
      "description": "Create and bind a task worktree.",
-     "input_schema": {
+     "parameters": {
          "type": "object",
          "properties": {
              "name": {"type": "string",
@@ -1632,7 +1636,7 @@ TEAM_TOOLS = [
                       "maxLength": 64},
              "task_id": {"type": "string"}},
          "required": ["name", "task_id"],
-         "additionalProperties": False}},
+         "additionalProperties": False}}},
 ]
 
 TOOLS = [*BASE_TOOLS, *TASK_TOOLS, *TEAM_TOOLS]
@@ -1727,14 +1731,8 @@ def context_hook(query: str):
 
 def summary_hook(messages: list):
     tool_count = sum(
-        1
-        for message in messages
-        for block in (
-            message.get("content")
-            if isinstance(message.get("content"), list)
-            else []
-        )
-        if isinstance(block, dict) and block.get("type") == "tool_result"
+        1 for message in messages
+        if (message.get("role") if isinstance(message, dict) else getattr(message, "role", None)) == "tool"
     )
     print(f"[hook] Stop: session used {tool_count} tool calls")
     return None
@@ -1767,28 +1765,30 @@ def execute_tool(block) -> str:
 def agent_loop(messages: list):
     while True:
         try:
-            response = client.messages.create(
+            response = client.chat.completions.create(
                 model=MODEL,
-                system=SYSTEM,
-                messages=messages,
+                messages=[{"role": "system", "content": SYSTEM}, *messages],
                 tools=TOOLS,
                 max_tokens=8000,
-            )
+        )
         except Exception as exc:
             messages.append({
                 "role": "assistant",
-                "content": [{
-                    "type": "text",
-                    "text": f"[Error] {type(exc).__name__}: {exc}",
-                }],
+                "content": f"[Error] {type(exc).__name__}: {exc}",
             })
             release_completed_assignment("agent")
             trigger_hooks("Stop", messages)
             return
 
-        messages.append({"role": "assistant", "content": response.content})
+        message = response.choices[0].message
+        messages.append(message)
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            SimpleNamespace(
+                id=call.id,
+                name=call.function.name,
+                input=json.loads(call.function.arguments or "{}"),
+            )
+            for call in (message.tool_calls or [])
         ]
         if not tool_calls:
             release_completed_assignment("agent")
@@ -1800,22 +1800,18 @@ def agent_loop(messages: list):
             print(f"> {block.name}")
             output = execute_tool(block)
             print(output[:300])
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
+            results.append({"role": "tool", "tool_call_id": block.id, "content": output,
             })
-        messages.append({"role": "user", "content": results})
+        messages.extend(results)
 
 
 def print_last_assistant_message(history: list):
     if not history:
         return
-    for block in history[-1].get("content", []):
-        if getattr(block, "type", None) == "text":
-            print(block.text)
-        elif isinstance(block, dict) and block.get("type") == "text":
-            print(block.get("text", ""))
+    last = history[-1]
+    text = last.get("content") if isinstance(last, dict) else getattr(last, "content", None)
+    if text:
+        print(text)
 
 
 def wait_for_cli_event() -> tuple[str, str | None]:

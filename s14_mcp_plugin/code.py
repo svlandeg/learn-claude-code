@@ -3,7 +3,7 @@
 s14: MCP Tools - discover external tools and add them to the agent loop.
 
 Run:  python s14_mcp_plugin/code.py
-Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
+Need: pip install openai python-dotenv + .env with OPENCODE_API_KEY
 
     connect_mcp("docs")
               |
@@ -23,10 +23,12 @@ Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
 """
 
 import glob
+import json
 import os
 import re
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 try:
     import readline
@@ -34,15 +36,16 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    api_key=os.getenv("OPENCODE_API_KEY"),
+    base_url="https://opencode.ai/zen/v1",
+)
 MODEL = os.environ["MODEL_ID"]
 
 BASE_SYSTEM = (
@@ -123,30 +126,30 @@ def run_glob(pattern: str) -> str:
 
 
 BASE_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object",
+    {"type": "function", "function": {"name": "bash", "description": "Run a shell command.",
+     "parameters": {"type": "object",
                       "properties": {"command": {"type": "string"}},
-                      "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object",
+                      "required": ["command"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read file contents.",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "limit": {"type": "integer"}},
-                      "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object",
+                      "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Write content to a file.",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "content": {"type": "string"}},
-                      "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text once.",
-     "input_schema": {"type": "object",
+                      "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text once.",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "old_text": {"type": "string"},
                                      "new_text": {"type": "string"}},
-                      "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files by glob pattern; ** matches recursively.",
-     "input_schema": {"type": "object",
+                      "required": ["path", "old_text", "new_text"]}}},
+    {"type": "function", "function": {"name": "glob", "description": "Find files by glob pattern; ** matches recursively.",
+     "parameters": {"type": "object",
                       "properties": {"pattern": {"type": "string"}},
-                      "required": ["pattern"]}},
+                      "required": ["pattern"]}}},
 ]
 
 BASE_HANDLERS = {
@@ -299,15 +302,15 @@ def run_connect_mcp(name: str) -> str:
     return connect_mcp(name)
 
 
-CONNECT_TOOL = {
+CONNECT_TOOL = {"type": "function", "function": {
     "name": "connect_mcp",
     "description": "Connect to an MCP server and discover its tools.",
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {"name": {"type": "string", "enum": ["docs", "deploy"]}},
         "required": ["name"],
     },
-}
+}}
 
 BUILTIN_TOOLS = [*BASE_TOOLS, CONNECT_TOOL]
 BUILTIN_HANDLERS = {**BASE_HANDLERS, "connect_mcp": run_connect_mcp}
@@ -320,7 +323,7 @@ def assemble_tool_pool() -> tuple[list[dict], dict[str, callable]]:
     handlers = dict(BUILTIN_HANDLERS)
     policies: dict[str, str] = {}
     origins = {
-        tool["name"]: f"built-in tool {tool['name']!r}"
+        tool["function"]["name"]: f"built-in tool {tool['function']['name']!r}"
         for tool in tools
     }
 
@@ -342,11 +345,11 @@ def assemble_tool_pool() -> tuple[list[dict], dict[str, callable]]:
             if not isinstance(schema, dict) or schema.get("type", "object") != "object":
                 raise ValueError(f"Invalid input schema for {origin}")
             origins[prefixed] = origin
-            tools.append({
+            tools.append({"type": "function", "function": {
                 "name": prefixed,
                 "description": tool_def.get("description", ""),
-                "input_schema": schema,
-            })
+                "parameters": schema,
+            }})
             handlers[prefixed] = (
                 lambda *, client=server, tool=raw_name, **kwargs:
                 client.call_tool(tool, kwargs)
@@ -430,14 +433,8 @@ def context_hook(query: str):
 
 def summary_hook(messages: list):
     tool_count = sum(
-        1
-        for message in messages
-        for block in (
-            message.get("content")
-            if isinstance(message.get("content"), list)
-            else []
-        )
-        if isinstance(block, dict) and block.get("type") == "tool_result"
+        1 for message in messages
+        if (message.get("role") if isinstance(message, dict) else getattr(message, "role", None)) == "tool"
     )
     print(f"[hook] Stop: session used {tool_count} tool calls")
     return None
@@ -471,27 +468,29 @@ def agent_loop(messages: list):
     while True:
         try:
             tools, handlers = assemble_tool_pool()
-            response = client.messages.create(
+            response = client.chat.completions.create(
                 model=MODEL,
-                system=assemble_system_prompt(),
-                messages=messages,
+                messages=[{"role": "system", "content": assemble_system_prompt()}, *messages],
                 tools=tools,
                 max_tokens=8000,
-            )
+        )
         except Exception as exc:
             messages.append({
                 "role": "assistant",
-                "content": [{
-                    "type": "text",
-                    "text": f"[Error] {type(exc).__name__}: {exc}",
-                }],
+                "content": f"[Error] {type(exc).__name__}: {exc}",
             })
             trigger_hooks("Stop", messages)
             return
 
-        messages.append({"role": "assistant", "content": response.content})
+        message = response.choices[0].message
+        messages.append(message)
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            SimpleNamespace(
+                id=call.id,
+                name=call.function.name,
+                input=json.loads(call.function.arguments or "{}"),
+            )
+            for call in (message.tool_calls or [])
         ]
         if not tool_calls:
             trigger_hooks("Stop", messages)
@@ -502,12 +501,9 @@ def agent_loop(messages: list):
             print(f"> {block.name}")
             output = execute_tool(block, handlers)
             print(output[:300])
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
+            results.append({"role": "tool", "tool_call_id": block.id, "content": output,
             })
-        messages.append({"role": "user", "content": results})
+        messages.extend(results)
 
 
 if __name__ == "__main__":
@@ -525,9 +521,8 @@ if __name__ == "__main__":
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        for block in history[-1].get("content", []):
-            if getattr(block, "type", None) == "text":
-                print(block.text)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                print(block.get("text", ""))
+        last = history[-1]
+        text = last.get("content") if isinstance(last, dict) else getattr(last, "content", None)
+        if text:
+            print(text)
         print()

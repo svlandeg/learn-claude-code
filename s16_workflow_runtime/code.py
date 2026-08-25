@@ -244,11 +244,7 @@ class MockAgentRunner:
 
 
 def _response_text(response) -> str:
-    return "\n".join(
-        str(getattr(block, "text", ""))
-        for block in getattr(response, "content", [])
-        if getattr(block, "type", None) == "text"
-    ).strip()
+    return (response.choices[0].message.content or "").strip()
 
 
 def _parse_runner_json(text: str) -> object:
@@ -288,14 +284,13 @@ class AnthropicAgentRunner:
                 "\n\nReturn only one JSON object matching this schema:\n"
                 + json.dumps(schema, ensure_ascii=True, sort_keys=True)
             )
-        response = self.client.messages.create(
+        response = self.client.chat.completions.create(
             model=self.model,
-            system=(
+            messages=[{"role": "system", "content": (
                 "You are a focused workflow agent. Complete only the supplied "
                 "step. Do not claim access to files or results not included in "
                 "the prompt."
-            ),
-            messages=[{"role": "user", "content": request}],
+            )}, *[{"role": "user", "content": request}]],
             max_tokens=2000,
         )
         text = _response_text(response)
@@ -308,8 +303,8 @@ class AnthropicAgentRunner:
                 # Let ExecutionState's schema check trigger its single retry.
                 value = text
         usage = getattr(response, "usage", None)
-        tokens = int(getattr(usage, "input_tokens", 0) or 0) + int(
-            getattr(usage, "output_tokens", 0) or 0
+        tokens = int(getattr(usage, "prompt_tokens", 0) or 0) + int(
+            getattr(usage, "completion_tokens", 0) or 0
         )
         return RunnerOutput(value, tokens)
 
@@ -713,10 +708,10 @@ async def sample_workflow(ctx, args):
 # Saved workflow registry
 WORKFLOWS = {SAMPLE_META["name"]: (SAMPLE_META, sample_workflow)}
 
-WORKFLOW_TOOL = {
+WORKFLOW_TOOL = {"type": "function", "function": {
     "name": "Workflow",
     "description": "Run a saved workflow by name. Pass input in args.",
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "name": {"type": "string"},
@@ -726,7 +721,7 @@ WORKFLOW_TOOL = {
         "required": ["name"],
         "additionalProperties": False,
     },
-}
+}}
 
 
 def serialize_task(task):
@@ -785,7 +780,7 @@ def install_workflow_tool(host):
 
     def assemble_with_workflow():
         tools, handlers = base_assemble()
-        if not any(tool.get("name") == "Workflow" for tool in tools):
+        if not any((tool.get("function") or tool).get("name") == "Workflow" for tool in tools):
             tools.append(WORKFLOW_TOOL)
         handlers["Workflow"] = run_workflow_sync
         return tools, handlers

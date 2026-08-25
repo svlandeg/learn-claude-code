@@ -22,6 +22,7 @@ import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 try:
     import readline
@@ -33,16 +34,17 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
 DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    api_key=os.getenv("OPENCODE_API_KEY"),
+    base_url="https://opencode.ai/zen/v1",
+)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = (
@@ -120,30 +122,30 @@ def run_glob(pattern: str) -> str:
 
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object",
+    {"type": "function", "function": {"name": "bash", "description": "Run a shell command.",
+     "parameters": {"type": "object",
                       "properties": {"command": {"type": "string"}},
-                      "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object",
+                      "required": ["command"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read file contents.",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "limit": {"type": "integer"}},
-                      "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object",
+                      "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Write content to a file.",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "content": {"type": "string"}},
-                      "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object",
+                      "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text in a file once.",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "old_text": {"type": "string"},
                                      "new_text": {"type": "string"}},
-                      "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
-     "input_schema": {"type": "object",
+                      "required": ["path", "old_text", "new_text"]}}},
+    {"type": "function", "function": {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
+     "parameters": {"type": "object",
                       "properties": {"pattern": {"type": "string"}},
-                      "required": ["pattern"]}},
+                      "required": ["pattern"]}}},
 ]
 
 TOOL_HANDLERS = {
@@ -227,14 +229,8 @@ def context_inject_hook(query: str):
 
 def summary_hook(messages: list):
     tool_count = sum(
-        1
-        for message in messages
-        for block in (
-            message.get("content")
-            if isinstance(message.get("content"), list)
-            else []
-        )
-        if isinstance(block, dict) and block.get("type") == "tool_result"
+        1 for message in messages
+        if (message.get("role") if isinstance(message, dict) else getattr(message, "role", None)) == "tool"
     )
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
@@ -576,21 +572,21 @@ def run_cancel_cron(job_id: str) -> str:
 
 
 TOOLS.extend([
-    {"name": "schedule_cron",
+    {"type": "function", "function": {"name": "schedule_cron",
      "description": "Schedule a prompt with a 5-field cron expression.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {
                           "cron": {"type": "string"},
                           "prompt": {"type": "string"},
                           "recurring": {"type": "boolean"},
                           "durable": {"type": "boolean"}},
-                      "required": ["cron", "prompt"]}},
-    {"name": "list_crons", "description": "List scheduled cron jobs.",
-     "input_schema": {"type": "object", "properties": {}, "required": []}},
-    {"name": "cancel_cron", "description": "Cancel a cron job by ID.",
-     "input_schema": {"type": "object",
+                      "required": ["cron", "prompt"]}}},
+    {"type": "function", "function": {"name": "list_crons", "description": "List scheduled cron jobs.",
+     "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {"name": "cancel_cron", "description": "Cancel a cron job by ID.",
+     "parameters": {"type": "object",
                       "properties": {"job_id": {"type": "string"}},
-                      "required": ["job_id"]}},
+                      "required": ["job_id"]}}},
 ])
 
 TOOL_HANDLERS.update({
@@ -639,13 +635,12 @@ def agent_loop(messages: list, context: dict | None = None):
     waiting_for_ack = list(fired)
     while True:
         try:
-            response = client.messages.create(
+            response = client.chat.completions.create(
                 model=MODEL,
-                system=SYSTEM,
-                messages=messages,
+                messages=[{"role": "system", "content": SYSTEM}, *messages],
                 tools=TOOLS,
                 max_tokens=8000,
-            )
+        )
         except Exception as error:
             if waiting_for_ack:
                 del messages[scheduled_start:]
@@ -653,7 +648,8 @@ def agent_loop(messages: list, context: dict | None = None):
             print(f"  [error] {type(error).__name__}: {error}")
             return context
 
-        messages.append({"role": "assistant", "content": response.content})
+        message = response.choices[0].message
+        messages.append(message)
         if waiting_for_ack:
             try:
                 acknowledge_cron_jobs(waiting_for_ack)
@@ -662,7 +658,12 @@ def agent_loop(messages: list, context: dict | None = None):
             waiting_for_ack = []
 
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            SimpleNamespace(
+                id=call.id,
+                name=call.function.name,
+                input=json.loads(call.function.arguments or "{}"),
+            )
+            for call in (message.tool_calls or [])
         ]
         if not tool_calls:
             force = trigger_hooks("Stop", messages)
@@ -674,27 +675,19 @@ def agent_loop(messages: list, context: dict | None = None):
         results = []
         for block in tool_calls:
             output = execute_tool(block)
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
+            results.append({"role": "tool", "tool_call_id": block.id, "content": output,
             })
-        messages.append({"role": "user", "content": results})
+        messages.extend(results)
 
 
 def print_latest_assistant_text(messages: list):
     for message in reversed(messages):
-        if message.get("role") != "assistant":
+        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+        if role != "assistant":
             continue
-        content = message.get("content", "")
-        if isinstance(content, str):
+        content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+        if content:
             print(content)
-        else:
-            for block in content:
-                if getattr(block, "type", None) == "text":
-                    print(block.text)
-                elif isinstance(block, dict) and block.get("type") == "text":
-                    print(block.get("text", ""))
         return
 
 

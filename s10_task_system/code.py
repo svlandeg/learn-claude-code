@@ -29,6 +29,7 @@ import secrets
 import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 try:
     import readline
@@ -40,15 +41,16 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    api_key=os.getenv("OPENCODE_API_KEY"),
+    base_url="https://opencode.ai/zen/v1",
+)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = (
@@ -387,28 +389,28 @@ def run_complete_task(task_id: str) -> str:
 
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
-    {"name": "create_task", "description": "Create a task and return its runtime-generated ID.",
-     "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"], "additionalProperties": False}},
-    {"name": "update_task", "description": "Add dependencies using IDs returned by create_task.",
-     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string", "pattern": "^task_[0-9a-f]{8}$"}, "addBlockedBy": {"type": "array", "items": {"type": "string", "pattern": "^task_[0-9a-f]{8}$"}, "minItems": 1}}, "required": ["task_id", "addBlockedBy"], "additionalProperties": False}},
-    {"name": "list_tasks", "description": "List tasks with status, owner, and dependencies.",
-     "input_schema": {"type": "object", "properties": {}}},
-    {"name": "get_task", "description": "Get a task by ID.",
-     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
-    {"name": "claim_task", "description": "Claim a pending task whose dependencies are complete.",
-     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
-    {"name": "complete_task", "description": "Complete the task claimed by this agent.",
-     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
+    {"type": "function", "function": {"name": "bash", "description": "Run a shell command.",
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read file contents.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Write content to a file.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text in a file once.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}},
+    {"type": "function", "function": {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
+     "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}}},
+    {"type": "function", "function": {"name": "create_task", "description": "Create a task and return its runtime-generated ID.",
+     "parameters": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "update_task", "description": "Add dependencies using IDs returned by create_task.",
+     "parameters": {"type": "object", "properties": {"task_id": {"type": "string", "pattern": "^task_[0-9a-f]{8}$"}, "addBlockedBy": {"type": "array", "items": {"type": "string", "pattern": "^task_[0-9a-f]{8}$"}, "minItems": 1}}, "required": ["task_id", "addBlockedBy"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "list_tasks", "description": "List tasks with status, owner, and dependencies.",
+     "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "get_task", "description": "Get a task by ID.",
+     "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}}},
+    {"type": "function", "function": {"name": "claim_task", "description": "Claim a pending task whose dependencies are complete.",
+     "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}}},
+    {"type": "function", "function": {"name": "complete_task", "description": "Complete the task claimed by this agent.",
+     "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}}},
 ]
 
 TOOL_HANDLERS = {
@@ -494,14 +496,8 @@ def context_hook(query: str):
 
 def summary_hook(messages: list):
     tool_count = sum(
-        1
-        for message in messages
-        for block in (
-            message.get("content")
-            if isinstance(message.get("content"), list)
-            else []
-        )
-        if isinstance(block, dict) and block.get("type") == "tool_result"
+        1 for message in messages
+        if (message.get("role") if isinstance(message, dict) else getattr(message, "role", None)) == "tool"
     )
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
@@ -533,17 +529,22 @@ def execute_tool(block) -> str:
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL,
-            system=SYSTEM,
-            messages=messages,
+            messages=[{"role": "system", "content": SYSTEM}, *messages],
             tools=TOOLS,
             max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        message = response.choices[0].message
+        messages.append(message)
 
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            SimpleNamespace(
+                id=call.id,
+                name=call.function.name,
+                input=json.loads(call.function.arguments or "{}"),
+            )
+            for call in (message.tool_calls or [])
         ]
         if not tool_calls:
             force = trigger_hooks("Stop", messages)
@@ -555,12 +556,9 @@ def agent_loop(messages: list):
         results = []
         for block in tool_calls:
             output = execute_tool(block)
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
+            results.append({"role": "tool", "tool_call_id": block.id, "content": output,
             })
-        messages.append({"role": "user", "content": results})
+        messages.extend(results)
 
 
 if __name__ == "__main__":
@@ -579,7 +577,8 @@ if __name__ == "__main__":
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        last = history[-1]
+        text = last.get("content") if isinstance(last, dict) else getattr(last, "content", None)
+        if text:
+            print(text)
         print()

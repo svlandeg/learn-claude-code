@@ -14,9 +14,10 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 try:
@@ -30,13 +31,14 @@ except ImportError:
     pass
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    api_key=os.getenv("OPENCODE_API_KEY"),
+    base_url="https://opencode.ai/zen/v1",
+)
 MODEL = os.environ["MODEL_ID"]
 
 # -- Memory store --
@@ -229,7 +231,9 @@ def block_text(block) -> str:
         else ""
     )
 
-def message_text(message: dict) -> str:
+def message_text(message) -> str:
+    if not isinstance(message, dict):
+        return str(getattr(message, "content", "") or "")
     content = message.get("content", "")
     if isinstance(content, str):
         return content
@@ -296,13 +300,13 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
     )
 
     try:
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
         )
         indices = extract_json_array(
-            message_text({"content": response.content})
+            (response.choices[0].message.content or "")
         )
         selected = []
         for index in indices:
@@ -353,9 +357,10 @@ def build_system(relevant_memories: str = "") -> str:
 def dialogue_text(messages: list, max_messages: int = 12) -> str:
     lines = []
     for message in messages[-max_messages:]:
+        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", "unknown")
         text = message_text(message).strip()
         if text:
-            lines.append(f"{message.get('role', 'unknown')}: {text}")
+            lines.append(f"{role}: {text}")
     return "\n".join(lines)[:8000]
 
 def validate_memory_record(
@@ -410,7 +415,7 @@ def extract_memories(messages: list) -> int:
     )
 
     try:
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1000,
@@ -418,7 +423,7 @@ def extract_memories(messages: list) -> int:
         candidates = [
             validated
             for item in extract_json_array(
-                message_text({"content": response.content})
+                (response.choices[0].message.content or "")
             )
             if (
                 validated := validate_memory_record(
@@ -472,7 +477,7 @@ def consolidate_memories() -> int:
             raise ValueError(
                 "memory store is too large for one consolidation pass"
             )
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=3000,
@@ -480,7 +485,7 @@ def consolidate_memories() -> int:
         consolidated = [
             validated
             for item in extract_json_array(
-                message_text({"content": response.content})
+                (response.choices[0].message.content or "")
             )
             if (validated := validate_memory_record(item)) is not None
         ]
@@ -599,16 +604,16 @@ def run_glob(pattern: str) -> str:
         return f"Error: {error}"
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {"type": "function", "function": {"name": "bash", "description": "Run a shell command.",
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read file contents.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Write content to a file.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text in a file once.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}},
+    {"type": "function", "function": {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
+     "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}}},
 ]
 
 TOOL_HANDLERS = {
@@ -673,14 +678,8 @@ def context_inject_hook(query: str):
 
 def summary_hook(messages: list):
     tool_count = sum(
-        1
-        for message in messages
-        for block in (
-            message.get("content")
-            if isinstance(message.get("content"), list)
-            else []
-        )
-        if isinstance(block, dict) and block.get("type") == "tool_result"
+        1 for message in messages
+        if (message.get("role") if isinstance(message, dict) else getattr(message, "role", None)) == "tool"
     )
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
@@ -712,20 +711,22 @@ def agent_loop(messages: list):
     system = build_system(relevant_memories)
 
     while True:
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL,
-            system=system,
-            messages=messages,
+            messages=[{"role": "system", "content": system}, *messages],
             tools=TOOLS,
             max_tokens=8000,
         )
-        messages.append({
-            "role": "assistant",
-            "content": response.content,
-        })
+        message = response.choices[0].message
+        messages.append(message)
 
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            SimpleNamespace(
+                id=call.id,
+                name=call.function.name,
+                input=json.loads(call.function.arguments or "{}"),
+            )
+            for call in (message.tool_calls or [])
         ]
         if not tool_calls:
             force = trigger_hooks("Stop", messages)
@@ -739,12 +740,9 @@ def agent_loop(messages: list):
         results = []
         for block in tool_calls:
             output = execute_tool(block)
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
+            results.append({"role": "tool", "tool_call_id": block.id, "content": output,
             })
-        messages.append({"role": "user", "content": results})
+        messages.extend(results)
 
 if __name__ == "__main__":
     print("s09: Memory - selective knowledge across sessions")
@@ -762,7 +760,8 @@ if __name__ == "__main__":
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        last = history[-1]
+        text = last.get("content") if isinstance(last, dict) else getattr(last, "content", None)
+        if text:
+            print(text)
         print()

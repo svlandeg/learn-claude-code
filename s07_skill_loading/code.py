@@ -19,9 +19,11 @@ The model loads the full SKILL.md only when it calls load_skill.
      +--------- tool_result --------+
 """
 
+import json
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
@@ -34,16 +36,17 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
 SKILLS_DIR = WORKDIR / "skills"
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    api_key=os.getenv("OPENCODE_API_KEY"),
+    base_url="https://opencode.ai/zen/v1",
+)
 MODEL = os.environ["MODEL_ID"]
 
 
@@ -199,18 +202,18 @@ def run_glob(pattern: str) -> str:
 
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
-    {"name": "load_skill", "description": "Load the full SKILL.md content by skill name.",
-     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"type": "function", "function": {"name": "bash", "description": "Run a shell command.",
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read file contents.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Write content to a file.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text in a file once.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}},
+    {"type": "function", "function": {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
+     "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}}},
+    {"type": "function", "function": {"name": "load_skill", "description": "Load the full SKILL.md content by skill name.",
+     "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}},
 ]
 
 TOOL_HANDLERS = {
@@ -294,14 +297,8 @@ def context_inject_hook(query: str):
 def summary_hook(messages: list):
     """Stop: print the number of tool results in this message list."""
     tool_count = sum(
-        1
-        for message in messages
-        for block in (
-            message.get("content")
-            if isinstance(message.get("content"), list)
-            else []
-        )
-        if isinstance(block, dict) and block.get("type") == "tool_result"
+        1 for message in messages
+        if (message.get("role") if isinstance(message, dict) else getattr(message, "role", None)) == "tool"
     )
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
@@ -331,17 +328,22 @@ def execute_tool(block) -> str:
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL,
-            system=SYSTEM,
-            messages=messages,
+            messages=[{"role": "system", "content": SYSTEM}, *messages],
             tools=TOOLS,
             max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        message = response.choices[0].message
+        messages.append(message)
 
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            SimpleNamespace(
+                id=call.id,
+                name=call.function.name,
+                input=json.loads(call.function.arguments or "{}"),
+            )
+            for call in (message.tool_calls or [])
         ]
         if not tool_calls:
             force = trigger_hooks("Stop", messages)
@@ -353,12 +355,9 @@ def agent_loop(messages: list):
         results = []
         for block in tool_calls:
             output = execute_tool(block)
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
+            results.append({"role": "tool", "tool_call_id": block.id, "content": output,
             })
-        messages.append({"role": "user", "content": results})
+        messages.extend(results)
 
 
 if __name__ == "__main__":
@@ -377,7 +376,8 @@ if __name__ == "__main__":
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        last = history[-1]
+        text = last.get("content") if isinstance(last, dict) else getattr(last, "content", None)
+        if text:
+            print(text)
         print()
